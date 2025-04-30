@@ -1,117 +1,63 @@
-const { Client, IntentsBitField } = require('discord.js');
+const { Client, GatewayIntentBits, Events } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
-
-const TOKEN = 'bot_token'; //use the public token for the bot
-const SPEED_MULTIPLIER = 1;
+const { token } = require('./config.json');
 
 const client = new Client({
-  intents: [
-    IntentsBitField.Flags.Guilds,
-    IntentsBitField.Flags.GuildMessages,
-    IntentsBitField.Flags.MessageContent
-  ]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 
-function parseLogContent(content) {
-  
-  const lines = content.split(/\r?\n/); // handles both \n and \r\n
-
-  const parsed = [];
-  for (const line of lines) {
-    const match = line.match(/^(\d{2}):(\d{2}):(\d{2})([ap])\s*\|\s*(.+)$/i);
-    if (!match) continue;
-
-    let [_, hour, minute, second, meridiem, text] = match;
-
-    hour = parseInt(hour, 10);
-    minute = parseInt(minute, 10);
-    second = parseInt(second, 10);
-
-    // Handle AM/PM
-    if (meridiem.toLowerCase() === 'p' && hour < 12) hour += 12;
-    if (meridiem.toLowerCase() === 'a' && hour === 12) hour = 0;
-
-    const timestamp = new Date();
-    timestamp.setHours(hour, minute, second, 0);
-
-    parsed.push({ timestamp, content: text });
-  }
-
-  console.log(`Parsed ${parsed.length} lines.`); // helpful debug
-  return parsed;
-}
-
-async function downloadAttachment(url, filepath) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(filepath);
-    https.get(url, response => {
-      response.pipe(file);
-      file.on('finish', () => file.close(resolve));
-    }).on('error', reject);
-  });
-}
-
-async function replayLog(channel, filepath) {
-  const content = fs.readFileSync(filepath, 'utf-8');
-  const parsed = parseLogContent(content);
-  if (parsed.length === 0) return channel.send("The uploaded log is empty or invalid.");
-
-  const groupedMessages = [];
-  let lastTimestamp = null;
-  let currentBatch = [];
-
-  // Group messages by timestamp
-  parsed.forEach(({ timestamp, content }) => {
-    if (lastTimestamp && timestamp.getTime() === lastTimestamp.getTime()) {
-      // Same timestamp, add to the batch
-      currentBatch.push(content);
-    } else {
-      // New timestamp, save the previous batch if it exists
-      if (currentBatch.length > 0) {
-        groupedMessages.push({ timestamp: lastTimestamp, messages: currentBatch });
-      }
-      currentBatch = [content]; // Start a new batch
-      lastTimestamp = timestamp;
-    }
-  });
-
-  // Add the last batch
-  if (currentBatch.length > 0) {
-    groupedMessages.push({ timestamp: lastTimestamp, messages: currentBatch });
-  }
-
-  // Replay grouped messages
-  for (const group of groupedMessages) {
-    const timestamp = group.timestamp;
-    const messages = group.messages.join('\n'); // Combine messages in the batch
-
-    setTimeout(() => {
-      channel.send(messages); // Send batch as a single message
-    }, timestamp.getTime() - Date.now());
-  }
-}
-
-client.once('ready', () => {
+client.once(Events.ClientReady, () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
-client.on('messageCreate', async message => {
-  if (message.content === '!replaylog') {
-    const attachment = message.attachments.first();
+client.on(Events.MessageCreate, async message => {
+  if (!message.attachments.size || message.author.bot) return;
 
-    if (!attachment) {
-      return message.reply("Please attach a log file with your command.");
+  const attachment = message.attachments.first();
+  if (!attachment.name.endsWith('.txt')) return;
+
+  try {
+    const response = await fetch(attachment.url);
+    const text = await response.text();
+
+    const lines = text.split(/\r?\n/).filter(line => line.trim() !== '');
+    if (lines.length === 0) {
+      message.reply('The uploaded log is empty or invalid.');
+      return;
     }
 
-    const tempPath = path.join(__dirname, 'uploaded_log.txt');
-    await downloadAttachment(attachment.url, tempPath);
+    // Parse and group by timestamp
+    const timestampGroups = [];
+    let currentGroup = null;
 
-    await message.channel.send("Starting log replay...");
-    replayLog(message.channel, tempPath);
+    for (const line of lines) {
+      const match = line.match(/^(\d{2}:\d{2}:\d{2}[ap]) \| (.*)$/);
+      if (!match) continue;
+
+      const [_, timestamp, content] = match;
+
+      if (!currentGroup || currentGroup.timestamp !== timestamp) {
+        if (currentGroup) timestampGroups.push(currentGroup);
+        currentGroup = { timestamp, messages: [] };
+      }
+
+      currentGroup.messages.push(content);
+    }
+    if (currentGroup) timestampGroups.push(currentGroup);
+
+    // Send messages in sequence
+    for (const group of timestampGroups) {
+      const combined = group.messages.join('\n');
+      await message.channel.send(`\n${combined}`);
+      await new Promise(res => setTimeout(res, 1000)); // wait 1s between groups
+    }
+
+  } catch (err) {
+    console.error('Error processing log file:', err);
+    message.reply('There was an error processing the log.');
   }
 });
 
-client.login(TOKEN);
+client.login(token);
 
